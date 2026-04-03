@@ -61,7 +61,7 @@
 
 | Параметр | Опис | Приклад |
 |----------|------|---------|
-| `serial_port` | Порт USB модему | `/dev/ttyUSB0` |
+| `serial_port` | Порт USB модему | `/dev/ttyUSB0` або `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0` |
 | `serial_baudrate` | Швидкість порту | `115200` |
 | `serial_watchdog_timeout` | Таймаут watchdog (сек) | `60` |
 | `mqtt_host` | IP або hostname MQTT брокера | `192.168.1.100` або `core-mosquitto` |
@@ -90,7 +90,7 @@
 **Налаштування → Система → Обладнання → Всі пристрої**
 
 Знайди свій SIM800 — порт зазвичай:
-- `/dev/ttyUSB0` — найпоширеніший варіант
+- `/dev/ttyUSB0` або `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0` — найпоширеніший варіант
 - `/dev/ttyUSB1` — якщо є інші USB пристрої
 - `/dev/ttyACM0` — деякі моделі
 
