@@ -115,15 +115,31 @@ def is_trusted(phone: str, trusted_list: list) -> bool:
 # ─────────────────────────────────────────────
 
 class ATSerial:
+    """
+    Queue-based serial reader.
+
+    Єдиний внутрішній reader-loop (_pump) безперервно читає рядки з порту
+    і роздає їх:
+      - у _at_queue  — якщо зараз виконується AT команда (is_at_busy=True)
+      - у _urc_queue — всі інші рядки (URC, unsolicited)
+
+    Це повністю усуває race condition між send_at() і _serial_reader().
+    """
+
     def __init__(self, port: str, baudrate: int, at_timeout: float):
         self.port = port
         self.baudrate = baudrate
         self.at_timeout = at_timeout
         self._reader = None
         self._writer = None
-        self._lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()   # лок тільки на запис
+        self._at_lock = asyncio.Lock()      # лок на час AT команди
+        self._at_queue: asyncio.Queue = asyncio.Queue()
+        self._urc_queue: asyncio.Queue = asyncio.Queue()
+        self._is_at_busy = False
         self._connected = False
         self._last_activity = time.monotonic()
+        self._pump_task: asyncio.Task | None = None
 
     @property
     def connected(self) -> bool:
@@ -140,10 +156,19 @@ class ATSerial:
         )
         self._connected = True
         self._last_activity = time.monotonic()
+        # Запускаємо єдиний pump loop
+        self._pump_task = asyncio.create_task(self._pump(), name="serial_pump")
         logger.info("Serial connected")
 
     async def disconnect(self):
         self._connected = False
+        if self._pump_task:
+            self._pump_task.cancel()
+            try:
+                await self._pump_task
+            except asyncio.CancelledError:
+                pass
+            self._pump_task = None
         if self._writer:
             try:
                 self._writer.close()
@@ -153,46 +178,120 @@ class ATSerial:
         self._reader = None
         self._writer = None
 
+    async def _pump(self):
+        """
+        Єдиний reader coroutine — читає рядки і розподіляє по чергах.
+        Ніхто більше не читає з self._reader напряму.
+        """
+        while self._connected:
+            try:
+                raw = await asyncio.wait_for(self._reader.readline(), timeout=2.0)
+                decoded = raw.decode(errors="replace").strip()
+                if not decoded:
+                    continue
+                self._last_activity = time.monotonic()
+                logger.debug(f"<< {decoded!r}")
+                # Якщо зараз виконується AT команда — рядок іде в AT чергу
+                if self._is_at_busy:
+                    await self._at_queue.put(decoded)
+                else:
+                    await self._urc_queue.put(decoded)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if self._connected:
+                    logger.error(f"Serial pump error: {e}")
+                await asyncio.sleep(0.5)
+
     async def send_at(self, cmd: str, wait_for: str = "OK", timeout: float | None = None) -> str:
+        """
+        Надіслати AT команду і дочекатись відповіді.
+        Під час виконання всі рядки з serial йдуть у _at_queue.
+        """
         if not self._connected:
             raise ConnectionError("Serial not connected")
         timeout = timeout or self.at_timeout
-        async with self._lock:
-            self._writer.write(f"{cmd}\r\n".encode())
-            await self._writer.drain()
-            self._last_activity = time.monotonic()
-            lines = []
+
+        async with self._at_lock:
+            # Очищаємо стару AT чергу перед новою командою
+            while not self._at_queue.empty():
+                self._at_queue.get_nowait()
+
+            self._is_at_busy = True
             try:
+                async with self._write_lock:
+                    self._writer.write(f"{cmd}\r\n".encode())
+                    await self._writer.drain()
+                self._last_activity = time.monotonic()
+
+                lines = []
                 async with asyncio.timeout(timeout):
                     while True:
-                        raw = await self._reader.readline()
-                        decoded = raw.decode(errors="replace").strip()
+                        decoded = await self._at_queue.get()
                         if decoded:
                             lines.append(decoded)
                         if decoded in (wait_for, "ERROR", "NO CARRIER", "BUSY"):
                             break
                         if decoded.startswith("+CMS ERROR") or decoded.startswith("+CME ERROR"):
                             break
+                self._last_activity = time.monotonic()
+                return "\n".join(lines)
+
             except asyncio.TimeoutError:
                 logger.warning(f"AT timeout: {cmd!r}")
                 raise
-            self._last_activity = time.monotonic()
-            return "\n".join(lines)
+            finally:
+                self._is_at_busy = False
 
-    async def readline(self, timeout: float = 1.0) -> str | None:
+    async def read_urc(self, timeout: float = 1.0) -> str | None:
+        """
+        Отримати наступний URC рядок (unsolicited).
+        Викликається з _serial_reader — без прямого читання з порту.
+        """
         if not self._connected:
             return None
         try:
-            async with asyncio.timeout(timeout):
-                raw = await self._reader.readline()
-                decoded = raw.decode(errors="replace").strip()
-                self._last_activity = time.monotonic()
-                return decoded if decoded else None
+            return await asyncio.wait_for(self._urc_queue.get(), timeout=timeout)
         except asyncio.TimeoutError:
             return None
         except Exception as e:
-            logger.error(f"readline error: {e}")
+            logger.error(f"read_urc error: {e}")
             return None
+
+    async def send_pdu_data(self, pdu: str, timeout: float = 30.0) -> str:
+        """
+        Надіслати PDU дані після промпту '>' для SMS.
+        Використовує той самий AT lock і чергу.
+        """
+        if not self._connected:
+            raise ConnectionError("Serial not connected")
+
+        async with self._at_lock:
+            while not self._at_queue.empty():
+                self._at_queue.get_nowait()
+
+            self._is_at_busy = True
+            try:
+                async with self._write_lock:
+                    self._writer.write((pdu + "\x1A").encode())
+                    await self._writer.drain()
+
+                lines = []
+                async with asyncio.timeout(timeout):
+                    while True:
+                        decoded = await self._at_queue.get()
+                        if decoded:
+                            lines.append(decoded)
+                        if decoded in ("OK", "ERROR") or decoded.startswith("+CMS ERROR") or decoded.startswith("+CMGS"):
+                            break
+                return "\n".join(lines)
+            except asyncio.TimeoutError:
+                logger.error("PDU send timeout")
+                raise
+            finally:
+                self._is_at_busy = False
 
 
 # ─────────────────────────────────────────────
@@ -274,32 +373,18 @@ class ModemManager:
     async def send_sms(self, phone: str, text: str) -> bool:
         try:
             pdu, pdu_len = build_pdu(phone, text)
+            # Крок 1: ініціювати передачу — чекаємо промпт '>'
             resp = await self.at.send_at(f"AT+CMGS={pdu_len}", wait_for=">", timeout=10)
             if ">" not in resp:
                 logger.error(f"CMGS prompt missing: {resp!r}")
                 return False
-            async with self.at._lock:
-                self.at._writer.write((pdu + "\x1A").encode())
-                await self.at._writer.drain()
-                lines = []
-                try:
-                    async with asyncio.timeout(30):
-                        while True:
-                            raw = await self.at._reader.readline()
-                            decoded = raw.decode(errors="replace").strip()
-                            if decoded:
-                                lines.append(decoded)
-                            if decoded in ("OK", "ERROR") or decoded.startswith("+CMS ERROR"):
-                                break
-                except asyncio.TimeoutError:
-                    logger.error("SMS send timeout")
-                    return False
-                full = "\n".join(lines)
-                if "OK" in full or "+CMGS" in full:
-                    logger.info(f"SMS sent to {phone}")
-                    return True
-                logger.error(f"SMS failed: {full!r}")
-                return False
+            # Крок 2: надіслати PDU через окремий метод з власним локом
+            full = await self.at.send_pdu_data(pdu, timeout=30)
+            if "OK" in full or "+CMGS" in full:
+                logger.info(f"SMS sent to {phone}")
+                return True
+            logger.error(f"SMS failed: {full!r}")
+            return False
         except Exception as e:
             logger.error(f"send_sms error: {e}")
             return False
@@ -405,11 +490,12 @@ class GSMMQTTGateway:
                 await asyncio.sleep(1)
                 continue
             try:
-                line = await self.at.readline(timeout=1.0)
+                # Читаємо з URC черги — не напряму з serial порту
+                line = await self.at.read_urc(timeout=1.0)
                 if not line:
                     continue
-                logger.debug(f"<< {line!r}")
 
+                # Двострочний SMS: заголовок потім PDU
                 if sms_header is not None:
                     await self._handle_sms_pdu(sms_header, line)
                     sms_header = None
