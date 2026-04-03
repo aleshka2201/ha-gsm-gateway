@@ -1,0 +1,66 @@
+name: "GSM MQTT Gateway"
+description: "SIM800 USB GSM to MQTT gateway. Bidirectional SMS and call handling."
+version: "1.0.0"
+slug: "gsm_gateway"
+init: false
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+startup: services
+boot: auto
+map:
+  - config:rw
+
+options:
+  serial_port: "/dev/ttyUSB0"
+  serial_baudrate: 115200
+  serial_watchdog_timeout: 60
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_client_id: "gsm_gateway"
+  topic_sms_inbox: "gsm/sms/inbox"
+  topic_sms_send: "gsm/sms/send"
+  topic_call_inbox: "gsm/call/inbox"
+  topic_call_dial: "gsm/call/dial"
+  topic_status: "gsm/status"
+  status_interval: 60
+  at_command_timeout: 10
+  log_level: "INFO"
+  trusted_numbers: []
+
+schema:
+  serial_port: str
+  serial_baudrate: int
+  serial_watchdog_timeout: int
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_username: str
+  mqtt_password: str
+  mqtt_client_id: str
+  topic_sms_inbox: str
+  topic_sms_send: str
+  topic_call_inbox: str
+  topic_call_dial: str
+  topic_status: str
+  status_interval: int
+  at_command_timeout: int
+  log_level: list(DEBUG|INFO|WARNING|ERROR)
+  trusted_numbers:
+    - str
+
+webui: "http://[HOST]:[PORT:8099]"
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: "Web UI (logs and status)"
+
+devices:
+  - /dev/ttyUSB0
+  - /dev/ttyUSB1
+  - /dev/ttyACM0
+
+url: "https://github.com/your-username/ha-gsm-gateway"
