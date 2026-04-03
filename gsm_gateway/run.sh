@@ -20,8 +20,34 @@ STATUS_INTERVAL=$(bashio::config 'status_interval')
 AT_TIMEOUT=$(bashio::config 'at_command_timeout')
 LOG_LEVEL=$(bashio::config 'log_level')
 
-# Build trusted numbers JSON array
-TRUSTED=$(bashio::config 'trusted_numbers')
+# Build trusted_numbers as proper YAML list
+# bashio::config returns a JSON array like ["+380501234567","+380671234567"]
+# We convert it to YAML list items using Python
+TRUSTED_YAML=$(python3 - <<'PYEOF'
+import json, sys, subprocess
+result = subprocess.run(
+    ["bashio", "config", "trusted_numbers"],
+    capture_output=True, text=True
+)
+raw = result.stdout.strip()
+try:
+    numbers = json.loads(raw)
+    if isinstance(numbers, list) and numbers:
+        print("\n".join(f'  - "{n}"' for n in numbers))
+    else:
+        print("  []")
+except Exception:
+    print("  []")
+PYEOF
+)
+
+# If list is non-empty write items, else write empty list
+if [ "$TRUSTED_YAML" = "  []" ]; then
+    TRUSTED_BLOCK="trusted_numbers: []"
+else
+    TRUSTED_BLOCK="trusted_numbers:
+${TRUSTED_YAML}"
+fi
 
 # Write generated config to /tmp/gateway_config.yaml
 cat > /tmp/gateway_config.yaml << EOF
@@ -51,15 +77,22 @@ gateway:
   status_interval: ${STATUS_INTERVAL}
   at_command_timeout: ${AT_TIMEOUT}
   log_level: "${LOG_LEVEL}"
-  trusted_numbers: $(bashio::config 'trusted_numbers' '[]')
+  ${TRUSTED_BLOCK}
 EOF
 
 bashio::log.info "Config generated. Serial port: ${SERIAL_PORT}, MQTT: ${MQTT_HOST}:${MQTT_PORT}"
 
-# Start Web UI in background
-python3 /webui.py &
+# Start Web UI as independent background process
+# Using nohup so it survives gateway restarts
+nohup python3 /webui.py > /tmp/webui.log 2>&1 &
 WEBUI_PID=$!
 bashio::log.info "Web UI started on port 8099 (PID: ${WEBUI_PID})"
 
-# Start gateway (foreground, supervisord will restart on crash)
-exec python3 /gateway.py /tmp/gateway_config.yaml
+# Gateway restart loop — Web UI залишається живим незалежно
+while true; do
+    bashio::log.info "Starting gateway process..."
+    python3 /gateway.py /tmp/gateway_config.yaml
+    EXIT_CODE=$?
+    bashio::log.warning "Gateway exited with code ${EXIT_CODE}, restarting in 5s..."
+    sleep 5
+done

@@ -367,9 +367,13 @@ class GSMMQTTGateway:
         self._mqtt_client = None
         self._send_queue: asyncio.Queue = asyncio.Queue()
         self._running = False
-        self._trusted: list = [
-            normalize_phone(str(n)) for n in self.gw_cfg.get("trusted_numbers", [])
-        ]
+        self._trusted: list = []
+        raw_trusted = self.gw_cfg.get("trusted_numbers", [])
+        # Guard: може прийти None, int, або список
+        if isinstance(raw_trusted, list):
+            self._trusted = [normalize_phone(str(n)) for n in raw_trusted]
+        elif raw_trusted:
+            self._trusted = [normalize_phone(str(raw_trusted))]
 
     # ── Serial ────────────────────────────────
 
