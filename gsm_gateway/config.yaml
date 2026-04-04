@@ -1,6 +1,6 @@
 name: "GSM MQTT Gateway"
-description: "SIM800 USB GSM to MQTT gateway. Bidirectional SMS and call handling."
-version: "1.3.0"
+description: "SIM800 USB GSM to MQTT gateway. Bidirectional SMS and call handling with Web UI."
+version: "1.4.0"
 slug: "gsm_gateway"
 init: false
 arch:
@@ -12,6 +12,13 @@ startup: services
 boot: auto
 map:
   - config:rw
+
+build:
+  build_from:
+    aarch64: ghcr.io/home-assistant/aarch64-base-python:3.12-alpine3.19
+    amd64:   ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.19
+    armhf:   ghcr.io/home-assistant/armhf-base-python:3.12-alpine3.19
+    armv7:   ghcr.io/home-assistant/armv7-base-python:3.12-alpine3.19
 
 options:
   serial_port: "/dev/ttyUSB0"
@@ -56,11 +63,11 @@ webui: "http://[HOST]:[PORT:8099]"
 ports:
   8099/tcp: 8099
 ports_description:
-  8099/tcp: "Web UI (logs and status)"
+  8099/tcp: "Web UI — logs and modem status"
 
 devices:
   - /dev/ttyUSB0
   - /dev/ttyUSB1
   - /dev/ttyACM0
 
-url: "https://github.com/aleshka2201/ha-gsm-gateway"
+url: "https://github.com/your-username/ha-gsm-gateway"

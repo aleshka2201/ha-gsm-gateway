@@ -1,82 +1,51 @@
-"""
-Генератор конфігу для GSM Gateway.
-Читає env змінні виставлені run.sh, будує gateway_config.yaml.
-Використовує yaml.dump щоб уникнути будь-яких проблем з форматуванням.
-"""
+"""Генерує /tmp/gw.yaml з env змінних виставлених run.sh."""
+import json, os, sys, yaml
 
-import json
-import os
-import sys
-import yaml
+def env(key, default=""):
+    return os.environ.get(key, str(default)).strip()
 
+def env_int(key, default):
+    try:    return int(env(key, default))
+    except: return default
 
-def get(key: str, default="") -> str:
-    return os.environ.get(key, default).strip()
-
-
-def get_int(key: str, default: int) -> int:
-    try:
-        return int(get(key, str(default)))
-    except ValueError:
-        return default
-
-
-def parse_trusted() -> list:
-    raw = get("GW_TRUSTED", "[]").strip()
-    if not raw:
+def parse_trusted():
+    raw = env("GW_TRUSTED", "[]")
+    if not raw or raw in ("null", "[]", ""):
         return []
-    # bashio повертає JSON масив: ["+380...", "+380..."]
-    # або порожній рядок / null
     try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            result = [str(n).strip().strip("'\"") for n in parsed if str(n).strip()]
-            print(f"[gen_config] Parsed trusted numbers: {result}", flush=True)
-            return result
-        if parsed:
-            return [str(parsed).strip().strip("'\"")] 
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [str(x).strip().strip("'\"") for x in data if str(x).strip()]
+        return [str(data).strip().strip("'\"")] if data else []
     except json.JSONDecodeError:
-        # Може бути просто рядок без дужок
-        s = raw.strip().strip("'\"[]")
-        if s:
-            return [s]
-    return []
+        s = raw.strip().strip("[]'\"")
+        return [s] if s else []
 
+trusted = parse_trusted()
+print(f"[gen_config] trusted_numbers: {trusted}", flush=True)
 
 cfg = {
-    "serial": {
-        "port":             get("GW_SERIAL_PORT", "/dev/ttyUSB0"),
-        "baudrate":         get_int("GW_SERIAL_BAUD", 115200),
-        "timeout":          get_int("GW_AT_TIMEOUT", 10),
-        "watchdog_timeout": get_int("GW_SERIAL_WD", 60),
-    },
-    "mqtt": {
-        "host":              get("GW_MQTT_HOST", "core-mosquitto"),
-        "port":              get_int("GW_MQTT_PORT", 1883),
-        "username":          get("GW_MQTT_USER", ""),
-        "password":          get("GW_MQTT_PASS", ""),
-        "client_id":         get("GW_MQTT_ID", "gsm_gateway"),
-        "keepalive":         30,
-        "reconnect_interval": 5,
-    },
-    "topics": {
-        "sms_inbox":  get("GW_TOPIC_SMS_IN",   "gsm/sms/inbox"),
-        "sms_send":   get("GW_TOPIC_SMS_OUT",  "gsm/sms/send"),
-        "call_inbox": get("GW_TOPIC_CALL_IN",  "gsm/call/inbox"),
-        "call_dial":  get("GW_TOPIC_CALL_OUT", "gsm/call/dial"),
-        "status":     get("GW_TOPIC_STATUS",   "gsm/status"),
-    },
-    "gateway": {
-        "status_interval":    get_int("GW_STATUS_INTERVAL", 60),
-        "at_command_timeout": get_int("GW_AT_TIMEOUT", 10),
-        "log_level":          get("GW_LOG_LEVEL", "INFO"),
-        "trusted_numbers":    parse_trusted(),
-    },
+    "serial":  {"port": env("GW_SERIAL_PORT", "/dev/ttyUSB0"),
+                "baudrate": env_int("GW_SERIAL_BAUD", 115200),
+                "watchdog_timeout": env_int("GW_SERIAL_WD", 60)},
+    "mqtt":    {"host": env("GW_MQTT_HOST", "core-mosquitto"),
+                "port": env_int("GW_MQTT_PORT", 1883),
+                "username": env("GW_MQTT_USER"),
+                "password": env("GW_MQTT_PASS"),
+                "client_id": env("GW_MQTT_ID", "gsm_gateway"),
+                "keepalive": 30, "reconnect_interval": 5},
+    "topics":  {"sms_inbox":  env("GW_TOPIC_SMS_IN",  "gsm/sms/inbox"),
+                "sms_send":   env("GW_TOPIC_SMS_OUT", "gsm/sms/send"),
+                "call_inbox": env("GW_TOPIC_CALL_IN", "gsm/call/inbox"),
+                "call_dial":  env("GW_TOPIC_CALL_OUT","gsm/call/dial"),
+                "status":     env("GW_TOPIC_STATUS",  "gsm/status")},
+    "gateway": {"at_command_timeout": env_int("GW_AT_TIMEOUT", 10),
+                "status_interval":    env_int("GW_STATUS_INTERVAL", 60),
+                "log_level":          env("GW_LOG_LEVEL", "INFO"),
+                "trusted_numbers":    trusted},
 }
 
-out = "/tmp/gateway_config.yaml"
-with open(out, "w", encoding="utf-8") as f:
+with open("/tmp/gw.yaml", "w", encoding="utf-8") as f:
     yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
 
-print(f"[gen_config] Config written to {out}", flush=True)
-print(f"[gen_config] Trusted: {cfg['gateway']['trusted_numbers']}", flush=True)
+print("[gen_config] /tmp/gw.yaml written OK", flush=True)

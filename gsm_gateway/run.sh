@@ -1,8 +1,8 @@
 #!/usr/bin/with-contenv bashio
 
-bashio::log.info "Starting GSM MQTT Gateway v1.3.0..."
+bashio::log.info "GSM MQTT Gateway v1.4.0 starting..."
 
-# Передаємо всі параметри як env змінні — Python сам будує конфіг
+# Export all settings as env vars — gen_config.py reads them
 export GW_SERIAL_PORT=$(bashio::config 'serial_port')
 export GW_SERIAL_BAUD=$(bashio::config 'serial_baudrate')
 export GW_SERIAL_WD=$(bashio::config 'serial_watchdog_timeout')
@@ -19,37 +19,28 @@ export GW_TOPIC_STATUS=$(bashio::config 'topic_status')
 export GW_STATUS_INTERVAL=$(bashio::config 'status_interval')
 export GW_AT_TIMEOUT=$(bashio::config 'at_command_timeout')
 export GW_LOG_LEVEL=$(bashio::config 'log_level')
+# bashio returns JSON array for list type: ["+380..."]
 export GW_TRUSTED=$(bashio::config 'trusted_numbers')
 
-bashio::log.info "Serial: ${GW_SERIAL_PORT}, MQTT: ${GW_MQTT_HOST}:${GW_MQTT_PORT}"
+bashio::log.info "Serial: ${GW_SERIAL_PORT} | MQTT: ${GW_MQTT_HOST}:${GW_MQTT_PORT}"
 
-# Генеруємо конфіг через Python
-python3 /gen_config.py
-if [ $? -ne 0 ]; then
-    bashio::log.error "Failed to generate config!"
+# Generate config via Python (avoids YAML injection from bash)
+if ! python3 /gen_config.py; then
+    bashio::log.error "Config generation failed!"
     exit 1
 fi
 
-# Показуємо trusted номери для діагностики
-python3 -c "
-import yaml
-with open('/tmp/gateway_config.yaml') as f:
-    cfg = yaml.safe_load(f)
-nums = cfg.get('gateway', {}).get('trusted_numbers', [])
-print(f'[DIAG] Trusted numbers in config: {nums}')
-"
-
 bashio::log.info "Config OK"
 
-# Web UI — незалежний процес
-nohup python3 /webui.py > /tmp/webui.log 2>&1 &
-bashio::log.info "Web UI started on port 8099"
+# Web UI — independent process, survives gateway crashes
+nohup python3 /webui.py >/tmp/webui.log 2>&1 &
+bashio::log.info "Web UI started (port 8099)"
 
-# Gateway restart loop
+# Gateway loop — auto-restart on crash
 while true; do
     bashio::log.info "Starting gateway..."
-    python3 /gateway.py /tmp/gateway_config.yaml
-    CODE=$?
-    bashio::log.warning "Gateway exited (code ${CODE}), restart in 5s..."
+    python3 /gateway.py /tmp/gw.yaml
+    RC=$?
+    bashio::log.warning "Gateway exited (rc=${RC}), restarting in 5s..."
     sleep 5
 done
