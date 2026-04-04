@@ -20,6 +20,7 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 COPY run.sh /run.sh
 COPY gateway.py /gateway.py
 COPY webui.py /webui.py
+COPY gen_config.py /gen_config.py
 
 RUN chmod +x /run.sh
 

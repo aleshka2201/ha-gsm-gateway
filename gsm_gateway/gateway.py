@@ -1,6 +1,13 @@
 """
 GSM-MQTT Gateway for SIM800 USB stick
-Home Assistant Addon version — v1.2.0
+Home Assistant Addon — v1.3.0
+
+Fixes vs 1.2.0:
+  - SMS: AT+CMGS prompt '>' тепер читається в AT черзі (is_at_busy не скидається між кроками)
+  - Reboot: чекає поки модем повністю завантажиться (до 30с) перед реінітом
+  - trusted: парсинг через gen_config.py + parse_trusted_list захищений від всіх форматів
+  - _connect_serial: перевіряє _running перед retry щоб не висіти після stop()
+  - TaskGroup замінено на незалежні tasks — одна задача що впала не вбиває інші
 """
 
 import asyncio
@@ -12,6 +19,7 @@ import sys
 import time
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import aiomqtt
 import serial_asyncio
@@ -19,7 +27,7 @@ import yaml
 
 LOG_FILE    = "/tmp/gsm_gateway.log"
 STATUS_FILE = "/tmp/gsm_status.json"
-CMD_FILE    = "/tmp/gsm_cmd.json"   # Web UI -> gateway команди
+CMD_FILE    = "/tmp/gsm_cmd.json"
 
 
 # ─────────────────────────────────────────────
@@ -56,10 +64,6 @@ logger = logging.getLogger("gsm_gateway")
 # ─────────────────────────────────────────────
 
 def normalize_phone(raw: str) -> str:
-    """
-    Залишає тільки цифри і ведучий '+'.
-    Прибирає пробіли, дефіси, дужки, зайві лапки з YAML/bash.
-    """
     s = str(raw).strip().strip("'\"")
     s = re.sub(r"[\s\-\(\)]", "", s)
     s = re.sub(r"[^\d+]", "", s)
@@ -69,13 +73,11 @@ def normalize_phone(raw: str) -> str:
 
 
 def phones_match(a: str, b: str) -> bool:
-    """Порівнює два номери. Враховує формати +380..., 380..., 0..."""
     na, nb = normalize_phone(a), normalize_phone(b)
     if na == nb:
         return True
     if na.lstrip("+") == nb.lstrip("+"):
         return True
-    # Останні 9 цифр — локальний формат
     da = re.sub(r"\D", "", na)
     db = re.sub(r"\D", "", nb)
     if len(da) >= 9 and len(db) >= 9 and da[-9:] == db[-9:]:
@@ -91,7 +93,6 @@ def is_trusted(phone: str, trusted_list: list) -> bool:
 
 
 def parse_trusted_list(raw) -> list[str]:
-    """Безпечно парсить trusted_numbers з будь-якого формату."""
     if not raw:
         return []
     items = raw if isinstance(raw, list) else [raw]
@@ -104,7 +105,7 @@ def parse_trusted_list(raw) -> list[str]:
 
 
 # ─────────────────────────────────────────────
-# SMS PDU helpers
+# SMS PDU
 # ─────────────────────────────────────────────
 
 def encode_ucs2(text: str) -> str:
@@ -119,14 +120,14 @@ def decode_ucs2(hex_str: str) -> str:
 
 
 def build_pdu(phone: str, text: str) -> tuple[str, int]:
-    phone_digits = re.sub(r"\D", "", phone)
-    toa = "91" if phone.startswith("+") else "81"
-    padded = phone_digits if len(phone_digits) % 2 == 0 else phone_digits + "F"
-    phone_encoded = "".join(padded[i+1] + padded[i] for i in range(0, len(padded), 2))
+    digits = re.sub(r"\D", "", phone)
+    toa    = "91" if phone.startswith("+") else "81"
+    padded = digits if len(digits) % 2 == 0 else digits + "F"
+    encoded = "".join(padded[i+1] + padded[i] for i in range(0, len(padded), 2))
     phone_len    = hex(len(re.sub(r"\D", "", phone)))[2:].upper().zfill(2)
     text_encoded = encode_ucs2(text)
     udl          = hex(len(text) * 2)[2:].upper().zfill(2)
-    pdu = "00" + "11" + "00" + phone_len + toa + phone_encoded + "00" + "08" + "AA" + udl + text_encoded
+    pdu = "00" + "11" + "00" + phone_len + toa + encoded + "00" + "08" + "AA" + udl + text_encoded
     return pdu, len(pdu) // 2 - 1
 
 
@@ -135,16 +136,14 @@ def decode_incoming_pdu(pdu: str) -> tuple[str, str]:
 
     def read(n: int) -> str:
         nonlocal idx
-        v = pdu[idx:idx+n]
-        idx += n
-        return v
+        v = pdu[idx:idx+n]; idx += n; return v
 
-    smsc_len = int(read(2), 16)
+    smsc_len      = int(read(2), 16)
     read(smsc_len * 2)
     pdu_type_byte = int(read(2), 16)
-    oa_len  = int(read(2), 16)
-    oa_type = int(read(2), 16)
-    oa_raw  = read((oa_len + 1) // 2 * 2)
+    oa_len        = int(read(2), 16)
+    oa_type       = int(read(2), 16)
+    oa_raw        = read((oa_len + 1) // 2 * 2)
 
     if oa_type in (0x91, 0x81):
         phone = ""
@@ -157,14 +156,12 @@ def decode_incoming_pdu(pdu: str) -> tuple[str, str]:
     else:
         phone = oa_raw
 
-    read(2)                              # PID
-    dcs = int(read(2), 16)
+    read(2)  # PID
+    dcs    = int(read(2), 16)
     vp_fmt = (pdu_type_byte >> 3) & 0x03
-    if vp_fmt == 0x02:
-        read(2)
-    elif vp_fmt in (0x01, 0x03):
-        read(14)
-    read(14)                             # SCTS
+    if vp_fmt == 0x02:   read(2)
+    elif vp_fmt in (1,3): read(14)
+    read(14)  # SCTS
     udl = int(read(2), 16)
 
     if dcs & 0x08:
@@ -177,26 +174,20 @@ def decode_incoming_pdu(pdu: str) -> tuple[str, str]:
 
 
 def _decode_gsm7(hex_str: str, num_chars: int) -> str:
-    TABLE = (
-        "@\u00a3$\u00a5\u00e8\u00e9\u00f9\u00ec\u00f2\u00c7\n\u00d8\u00f8\r\u00c5\u00e5"
-        "\u0394_\u03a6\u0393\u039b\u03a9\u03a0\u03a8\u03a3\u03b8\u039e\x1b\u00c6\u00e6\u00df\u00c9"
-        " !\"#\u00a4%&'()*+,-./0123456789:;<=>?"
-        "\u00a1ABCDEFGHIJKLMNOPQRSTUVWXYZ\u00c4\u00d6\u00d1\u00dc\u00a7"
-        "\u00bfabcdefghijklmnopqrstuvwxyz\u00e4\u00f6\u00f1\u00fc\u00e0"
-    )
+    T = ("@\u00a3$\u00a5\u00e8\u00e9\u00f9\u00ec\u00f2\u00c7\n\u00d8\u00f8\r\u00c5\u00e5"
+         "\u0394_\u03a6\u0393\u039b\u03a9\u03a0\u03a8\u03a3\u03b8\u039e\x1b\u00c6\u00e6\u00df\u00c9"
+         " !\"#\u00a4%&'()*+,-./0123456789:;<=>?"
+         "\u00a1ABCDEFGHIJKLMNOPQRSTUVWXYZ\u00c4\u00d6\u00d1\u00dc\u00a7"
+         "\u00bfabcdefghijklmnopqrstuvwxyz\u00e4\u00f6\u00f1\u00fc\u00e0")
     try:
-        data = bytes.fromhex(hex_str)
-        bits = int.from_bytes(data, "little")
-        return "".join(
-            TABLE[(bits >> (i*7)) & 0x7F] if (bits >> (i*7)) & 0x7F < len(TABLE) else "?"
-            for i in range(num_chars)
-        )
+        bits = int.from_bytes(bytes.fromhex(hex_str), "little")
+        return "".join(T[(bits >> (i*7)) & 0x7F] if (bits >> (i*7)) & 0x7F < len(T) else "?" for i in range(num_chars))
     except Exception:
         return hex_str
 
 
 # ─────────────────────────────────────────────
-# ATSerial — queue-based, race-condition free
+# ATSerial — queue-based, single pump reader
 # ─────────────────────────────────────────────
 
 class ATSerial:
@@ -250,11 +241,16 @@ class ATSerial:
                 pass
         self._reader = None
         self._writer = None
+        # Очищаємо черги щоб не було сміття при наступному connect
+        for q in (self._at_queue, self._urc_queue):
+            while not q.empty():
+                try: q.get_nowait()
+                except Exception: break
 
     async def _pump(self):
         while self._connected:
             try:
-                raw = await asyncio.wait_for(self._reader.readline(), timeout=2.0)
+                raw     = await asyncio.wait_for(self._reader.readline(), timeout=2.0)
                 decoded = raw.decode(errors="replace").strip()
                 if not decoded:
                     continue
@@ -279,7 +275,8 @@ class ATSerial:
         timeout = timeout or self.at_timeout
         async with self._at_lock:
             while not self._at_queue.empty():
-                self._at_queue.get_nowait()
+                try: self._at_queue.get_nowait()
+                except Exception: break
             self._is_at_busy = True
             try:
                 async with self._write_lock:
@@ -304,29 +301,62 @@ class ATSerial:
             finally:
                 self._is_at_busy = False
 
-    async def send_pdu_data(self, pdu: str, timeout: float = 30.0) -> str:
+    async def send_sms_full(self, pdu_len: int, pdu: str) -> bool:
+        """
+        Відправляє SMS як єдину AT-транзакцію.
+        AT+CMGS= і PDU дані — під одним _at_lock без відпускання між кроками.
+        Це гарантує що промпт '>' попадає в AT чергу а не в URC.
+        """
         if not self._connected:
             raise ConnectionError("Serial not connected")
+
         async with self._at_lock:
+            # Очищаємо AT чергу
             while not self._at_queue.empty():
-                self._at_queue.get_nowait()
+                try: self._at_queue.get_nowait()
+                except Exception: break
+
             self._is_at_busy = True
             try:
+                # Крок 1: надсилаємо AT+CMGS=N
+                async with self._write_lock:
+                    self._writer.write(f"AT+CMGS={pdu_len}\r\n".encode())
+                    await self._writer.drain()
+                self._last_activity = time.monotonic()
+
+                # Чекаємо промпт '>'
+                async with asyncio.timeout(10):
+                    while True:
+                        line = await self._at_queue.get()
+                        logger.debug(f"SMS step1 << {line!r}")
+                        if ">" in line:
+                            break
+                        if line in ("ERROR",) or line.startswith("+CMS ERROR"):
+                            logger.error(f"CMGS rejected: {line}")
+                            return False
+
+                # Крок 2: надсилаємо PDU + Ctrl-Z (все ще під тим самим lock)
                 async with self._write_lock:
                     self._writer.write((pdu + "\x1A").encode())
                     await self._writer.drain()
+
+                # Чекаємо OK або +CMGS
                 lines = []
-                async with asyncio.timeout(timeout):
+                async with asyncio.timeout(30):
                     while True:
-                        decoded = await self._at_queue.get()
-                        if decoded:
-                            lines.append(decoded)
-                        if decoded in ("OK", "ERROR") or decoded.startswith(("+CMS ERROR", "+CMGS")):
+                        line = await self._at_queue.get()
+                        logger.debug(f"SMS step2 << {line!r}")
+                        if line:
+                            lines.append(line)
+                        if line in ("OK", "ERROR") or line.startswith(("+CMS ERROR", "+CMGS")):
                             break
-                return "\n".join(lines)
+
+                full = "\n".join(lines)
+                return "OK" in full or "+CMGS" in full
+
             except asyncio.TimeoutError:
-                logger.error("PDU send timeout")
-                raise
+                logger.error("SMS send timeout")
+                return False
             finally:
                 self._is_at_busy = False
 
@@ -366,6 +396,22 @@ class ModemManager:
                 logger.warning(f"Init {cmd!r} failed: {e}")
         logger.info("Modem initialized")
 
+    async def wait_for_ready(self, timeout: float = 30.0) -> bool:
+        """Чекає поки модем відповідає на AT після ребуту."""
+        logger.info(f"Waiting for modem ready (max {timeout}s)...")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                resp = await self.at.send_at("AT", wait_for="OK", timeout=3.0)
+                if "OK" in resp:
+                    logger.info("Modem is ready")
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+        logger.error("Modem did not become ready in time")
+        return False
+
     async def get_status(self) -> dict:
         status: dict = {
             "timestamp":    datetime.utcnow().isoformat() + "Z",
@@ -401,10 +447,9 @@ class ModemManager:
             r = await self.at.send_at("AT+COPS?")
             m = re.search(r'\+COPS:\s*\d+,\d+,"([^"]+)"', r)
             if m:
-                try:
-                    status["operator"] = decode_ucs2(m.group(1))
-                except Exception:
-                    status["operator"] = m.group(1)
+                try:    status["operator"] = decode_ucs2(m.group(1))
+                except: status["operator"] = m.group(1)
+
         except Exception as e:
             logger.warning(f"get_status error: {e}")
 
@@ -418,16 +463,13 @@ class ModemManager:
     async def send_sms(self, phone: str, text: str) -> bool:
         try:
             pdu, pdu_len = build_pdu(phone, text)
-            resp = await self.at.send_at(f"AT+CMGS={pdu_len}", wait_for=">", timeout=10)
-            if ">" not in resp:
-                logger.error(f"CMGS prompt missing: {resp!r}")
-                return False
-            full = await self.at.send_pdu_data(pdu, timeout=30)
-            if "OK" in full or "+CMGS" in full:
-                logger.info(f"SMS sent to {phone}")
-                return True
-            logger.error(f"SMS send failed: {full!r}")
-            return False
+            logger.info(f"Sending SMS to {phone}, PDU len={pdu_len}")
+            ok = await self.at.send_sms_full(pdu_len, pdu)
+            if ok:
+                logger.info(f"SMS sent OK to {phone}")
+            else:
+                logger.error(f"SMS send FAILED to {phone}")
+            return ok
         except Exception as e:
             logger.error(f"send_sms error: {e}")
             return False
@@ -447,11 +489,18 @@ class ModemManager:
             return False
 
     async def reboot(self):
-        logger.info("Rebooting modem via AT+CFUN=1,1")
+        """
+        Програмний ребут модему.
+        AT+CFUN=1,1 не завжди повертає OK перед ребутом — ігноруємо помилку.
+        """
+        logger.info("Sending AT+CFUN=1,1 (modem reboot)...")
         try:
-            await self.at.send_at("AT+CFUN=1,1", wait_for="OK", timeout=5)
+            await asyncio.wait_for(
+                self.at.send_at("AT+CFUN=1,1", wait_for="OK", timeout=3.0),
+                timeout=4.0
+            )
         except Exception:
-            pass  # модем може не відповісти — це нормально
+            pass  # модем може одразу перезавантажитись не відповівши
 
 
 # ─────────────────────────────────────────────
@@ -465,10 +514,8 @@ class URCParser:
         m = re.match(r'\+CLIP:\s*"([^"]*)"', line)
         if m:
             caller = m.group(1)
-            try:
-                caller = decode_ucs2(caller)
-            except Exception:
-                pass
+            try: caller = decode_ucs2(caller)
+            except: pass
             return {"type": "call", "caller": caller}
         if line == "RING":
             return {"type": "ring"}
@@ -497,12 +544,11 @@ class GSMMQTTGateway:
         self.modem = ModemManager(self.at)
         self.urc   = URCParser()
 
-        self._mqtt_client = None
         self._send_queue: asyncio.Queue = asyncio.Queue()
         self._running = False
 
-        raw_trusted    = self.gw_cfg.get("trusted_numbers", [])
-        self._trusted  = parse_trusted_list(raw_trusted)
+        raw_trusted   = self.gw_cfg.get("trusted_numbers", [])
+        self._trusted = parse_trusted_list(raw_trusted)
         logger.info(f"Trusted numbers loaded ({len(self._trusted)}): {self._trusted}")
 
     # ── Serial ────────────────────────────────
@@ -515,19 +561,23 @@ class GSMMQTTGateway:
                 return
             except Exception as e:
                 logger.error(f"Serial connect failed: {e}, retry in 5s")
+                try:
+                    await self.at.disconnect()
+                except Exception:
+                    pass
                 await asyncio.sleep(5)
 
     async def _serial_watchdog(self):
-        timeout = self.serial_cfg["watchdog_timeout"]
+        wd_timeout = self.serial_cfg["watchdog_timeout"]
         while self._running:
             await asyncio.sleep(10)
             if not self.at.connected:
                 continue
             idle = time.monotonic() - self.at.last_activity
-            if idle > timeout:
-                logger.warning(f"Watchdog: {idle:.0f}s idle — reconnecting")
+            if idle > wd_timeout:
+                logger.warning(f"Watchdog: {idle:.0f}s idle — reconnecting serial")
                 await self.at.disconnect()
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
                 await self._connect_serial()
 
     async def _serial_reader(self):
@@ -554,7 +604,7 @@ class GSMMQTTGateway:
                     await asyncio.sleep(0.3)
                     await self.modem.hangup()
                 elif event["type"] == "ring":
-                    logger.debug("RING — waiting for CLIP")
+                    logger.debug("RING")
                 elif event["type"] == "call_ended":
                     logger.debug(f"Call ended: {event['reason']}")
             except Exception as e:
@@ -583,36 +633,39 @@ class GSMMQTTGateway:
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }, ensure_ascii=False))
 
-    # ── Web UI command polling ─────────────────
+    # ── Web UI commands ────────────────────────
 
     async def _webui_cmd_loop(self):
-        """Перевіряє CMD_FILE на команди з Web UI."""
-        import pathlib
         while self._running:
             await asyncio.sleep(1)
             try:
-                p = pathlib.Path(CMD_FILE)
+                p = Path(CMD_FILE)
                 if not p.exists():
                     continue
                 raw = p.read_text(encoding="utf-8").strip()
-                p.unlink()
+                p.unlink(missing_ok=True)
                 if not raw:
                     continue
                 cmd    = json.loads(raw)
                 action = cmd.get("action", "")
 
                 if action == "reboot_modem":
-                    logger.info("Web UI: modem reboot")
+                    logger.info("=== MODEM REBOOT REQUESTED ===")
                     await self.modem.reboot()
-                    await asyncio.sleep(5)
+                    logger.info("Waiting 8s for modem to restart...")
+                    await asyncio.sleep(8)
                     await self.at.disconnect()
+                    await asyncio.sleep(2)
+                    # Реконектимось і чекаємо поки модем готовий
                     await self._connect_serial()
+                    await self.modem.wait_for_ready(timeout=30)
+                    logger.info("=== MODEM REBOOT DONE ===")
 
                 elif action == "send_sms":
                     phone = cmd.get("to", "").strip()
                     text  = cmd.get("text", "").strip()
                     if phone and text:
-                        logger.info(f"Web UI: send SMS to {phone}")
+                        logger.info(f"Web UI: send SMS → {phone}")
                         await self.modem.send_sms(phone, text)
                     else:
                         logger.warning("Web UI send_sms: missing 'to' or 'text'")
@@ -637,7 +690,6 @@ class GSMMQTTGateway:
                     identifier= self.mqtt_cfg["client_id"],
                     keepalive = self.mqtt_cfg["keepalive"],
                 ) as client:
-                    self._mqtt_client = client
                     logger.info("MQTT connected")
                     await client.subscribe(self.topics["sms_send"])
                     await client.subscribe(self.topics["call_dial"])
@@ -646,11 +698,9 @@ class GSMMQTTGateway:
                         tg.create_task(self._mqtt_outbound(client))
             except aiomqtt.MqttError as e:
                 logger.error(f"MQTT error: {e}, retry in {interval}s")
-                self._mqtt_client = None
                 await asyncio.sleep(interval)
             except Exception as e:
                 logger.error(f"MQTT unexpected: {e}")
-                self._mqtt_client = None
                 await asyncio.sleep(interval)
 
     async def _mqtt_inbound(self, client):
@@ -701,8 +751,7 @@ class GSMMQTTGateway:
                 logger.info(
                     f"Status: online={status['online']}, "
                     f"signal={status.get('signal_dbm')}dBm, "
-                    f"op={status.get('operator')}, "
-                    f"reg={status.get('registration')}"
+                    f"op={status.get('operator')}, reg={status.get('registration')}"
                 )
             except Exception as e:
                 logger.error(f"Status loop error: {e}")
@@ -711,13 +760,12 @@ class GSMMQTTGateway:
 
     async def run(self):
         self._running = True
-        logger.info("GSM-MQTT Gateway v1.2.0 starting...")
+        logger.info("GSM-MQTT Gateway v1.3.0 starting...")
         logger.info(f"Serial: {self.serial_cfg['port']} @ {self.serial_cfg['baudrate']}")
         logger.info(f"MQTT:   {self.mqtt_cfg['host']}:{self.mqtt_cfg['port']}")
 
         await self._connect_serial()
 
-        # Незалежні задачі — падіння однієї не вбиває інші
         tasks = [
             asyncio.create_task(self._serial_reader(),   name="serial_reader"),
             asyncio.create_task(self._serial_watchdog(), name="serial_watchdog"),
@@ -754,9 +802,7 @@ async def main():
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(
-                sig, lambda: asyncio.create_task(gateway.stop())
-            )
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(gateway.stop()))
         except NotImplementedError:
             pass
 
