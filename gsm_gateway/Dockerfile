@@ -8,9 +8,10 @@ RUN apk add --no-cache \
     gcc \
     musl-dev \
     python3-dev \
+    py3-pip \
     libffi-dev
 
-RUN pip3 install --no-cache-dir --break-system-packages \
+RUN pip install --no-cache-dir --break-system-packages \
     aiomqtt==2.3.0 \
     pyserial-asyncio==0.6 \
     pyyaml==6.0.2
