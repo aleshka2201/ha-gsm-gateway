@@ -1,57 +1,106 @@
 """
 GSM-MQTT Gateway for SIM800 USB stick
-Home Assistant Addon version
+Home Assistant Addon version — v1.2.0
 """
 
 import asyncio
 import json
 import logging
 import re
+import signal
 import sys
 import time
 from datetime import datetime
-from pathlib import Path
+from logging.handlers import RotatingFileHandler
 
 import aiomqtt
 import serial_asyncio
 import yaml
 
-LOG_FILE = "/tmp/gsm_gateway.log"
+LOG_FILE    = "/tmp/gsm_gateway.log"
 STATUS_FILE = "/tmp/gsm_status.json"
+CMD_FILE    = "/tmp/gsm_cmd.json"   # Web UI -> gateway команди
 
 
 # ─────────────────────────────────────────────
-# Config loader
+# Config
 # ─────────────────────────────────────────────
 
-def load_config(path: str = "config.yaml") -> dict:
+def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 # ─────────────────────────────────────────────
-# Logging — console + rotating file
+# Logging
 # ─────────────────────────────────────────────
 
 def setup_logging(level: str):
     log_level = getattr(logging, level.upper(), logging.INFO)
-    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    fmt     = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
-
-    handlers = [logging.StreamHandler(sys.stdout)]
-
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     try:
-        from logging.handlers import RotatingFileHandler
-        fh = RotatingFileHandler(LOG_FILE, maxBytes=512 * 1024, backupCount=2, encoding="utf-8")
+        fh = RotatingFileHandler(LOG_FILE, maxBytes=512*1024, backupCount=2, encoding="utf-8")
         fh.setFormatter(logging.Formatter(fmt, datefmt))
         handlers.append(fh)
     except Exception:
         pass
-
     logging.basicConfig(level=log_level, format=fmt, datefmt=datefmt, handlers=handlers)
 
-
 logger = logging.getLogger("gsm_gateway")
+
+
+# ─────────────────────────────────────────────
+# Phone helpers
+# ─────────────────────────────────────────────
+
+def normalize_phone(raw: str) -> str:
+    """
+    Залишає тільки цифри і ведучий '+'.
+    Прибирає пробіли, дефіси, дужки, зайві лапки з YAML/bash.
+    """
+    s = str(raw).strip().strip("'\"")
+    s = re.sub(r"[\s\-\(\)]", "", s)
+    s = re.sub(r"[^\d+]", "", s)
+    if "+" in s:
+        s = "+" + s.replace("+", "")
+    return s
+
+
+def phones_match(a: str, b: str) -> bool:
+    """Порівнює два номери. Враховує формати +380..., 380..., 0..."""
+    na, nb = normalize_phone(a), normalize_phone(b)
+    if na == nb:
+        return True
+    if na.lstrip("+") == nb.lstrip("+"):
+        return True
+    # Останні 9 цифр — локальний формат
+    da = re.sub(r"\D", "", na)
+    db = re.sub(r"\D", "", nb)
+    if len(da) >= 9 and len(db) >= 9 and da[-9:] == db[-9:]:
+        return True
+    return False
+
+
+def is_trusted(phone: str, trusted_list: list) -> bool:
+    for t in trusted_list:
+        if phones_match(phone, t):
+            return True
+    return False
+
+
+def parse_trusted_list(raw) -> list[str]:
+    """Безпечно парсить trusted_numbers з будь-якого формату."""
+    if not raw:
+        return []
+    items = raw if isinstance(raw, list) else [raw]
+    result = []
+    for item in items:
+        n = normalize_phone(str(item))
+        if n:
+            result.append(n)
+    return result
 
 
 # ─────────────────────────────────────────────
@@ -70,74 +119,99 @@ def decode_ucs2(hex_str: str) -> str:
 
 
 def build_pdu(phone: str, text: str) -> tuple[str, int]:
-    smsc = "00"
-    pdu_type = "11"
-    mr = "00"
-    phone_clean = phone.lstrip("+")
-    type_of_address = "91" if phone.startswith("+") else "81"
-    if len(phone_clean) % 2 != 0:
-        phone_clean += "F"
-    phone_encoded = "".join(
-        phone_clean[i + 1] + phone_clean[i] for i in range(0, len(phone_clean), 2)
-    )
-    phone_len = hex(len(phone.lstrip("+")))[2:].upper().zfill(2)
-    pid = "00"
-    dcs = "08"
-    vp = "AA"
+    phone_digits = re.sub(r"\D", "", phone)
+    toa = "91" if phone.startswith("+") else "81"
+    padded = phone_digits if len(phone_digits) % 2 == 0 else phone_digits + "F"
+    phone_encoded = "".join(padded[i+1] + padded[i] for i in range(0, len(padded), 2))
+    phone_len    = hex(len(re.sub(r"\D", "", phone)))[2:].upper().zfill(2)
     text_encoded = encode_ucs2(text)
-    udl = hex(len(text) * 2)[2:].upper().zfill(2)
-    pdu = smsc + pdu_type + mr + phone_len + type_of_address + phone_encoded + pid + dcs + vp + udl + text_encoded
-    pdu_len = len(pdu) // 2 - 1
-    return pdu, pdu_len
+    udl          = hex(len(text) * 2)[2:].upper().zfill(2)
+    pdu = "00" + "11" + "00" + phone_len + toa + phone_encoded + "00" + "08" + "AA" + udl + text_encoded
+    return pdu, len(pdu) // 2 - 1
+
+
+def decode_incoming_pdu(pdu: str) -> tuple[str, str]:
+    idx = 0
+
+    def read(n: int) -> str:
+        nonlocal idx
+        v = pdu[idx:idx+n]
+        idx += n
+        return v
+
+    smsc_len = int(read(2), 16)
+    read(smsc_len * 2)
+    pdu_type_byte = int(read(2), 16)
+    oa_len  = int(read(2), 16)
+    oa_type = int(read(2), 16)
+    oa_raw  = read((oa_len + 1) // 2 * 2)
+
+    if oa_type in (0x91, 0x81):
+        phone = ""
+        for i in range(0, len(oa_raw) - 1, 2):
+            phone += oa_raw[i+1]
+            if oa_raw[i] != "F":
+                phone += oa_raw[i]
+        if oa_type == 0x91:
+            phone = "+" + phone
+    else:
+        phone = oa_raw
+
+    read(2)                              # PID
+    dcs = int(read(2), 16)
+    vp_fmt = (pdu_type_byte >> 3) & 0x03
+    if vp_fmt == 0x02:
+        read(2)
+    elif vp_fmt in (0x01, 0x03):
+        read(14)
+    read(14)                             # SCTS
+    udl = int(read(2), 16)
+
+    if dcs & 0x08:
+        text = decode_ucs2(pdu[idx:])
+    elif (dcs >> 2) & 0x03 == 0x01:
+        text = bytes.fromhex(pdu[idx:]).decode("latin-1", errors="replace")
+    else:
+        text = _decode_gsm7(pdu[idx:], udl)
+    return phone, text
+
+
+def _decode_gsm7(hex_str: str, num_chars: int) -> str:
+    TABLE = (
+        "@\u00a3$\u00a5\u00e8\u00e9\u00f9\u00ec\u00f2\u00c7\n\u00d8\u00f8\r\u00c5\u00e5"
+        "\u0394_\u03a6\u0393\u039b\u03a9\u03a0\u03a8\u03a3\u03b8\u039e\x1b\u00c6\u00e6\u00df\u00c9"
+        " !\"#\u00a4%&'()*+,-./0123456789:;<=>?"
+        "\u00a1ABCDEFGHIJKLMNOPQRSTUVWXYZ\u00c4\u00d6\u00d1\u00dc\u00a7"
+        "\u00bfabcdefghijklmnopqrstuvwxyz\u00e4\u00f6\u00f1\u00fc\u00e0"
+    )
+    try:
+        data = bytes.fromhex(hex_str)
+        bits = int.from_bytes(data, "little")
+        return "".join(
+            TABLE[(bits >> (i*7)) & 0x7F] if (bits >> (i*7)) & 0x7F < len(TABLE) else "?"
+            for i in range(num_chars)
+        )
+    except Exception:
+        return hex_str
 
 
 # ─────────────────────────────────────────────
-# Trusted number helpers
-# ─────────────────────────────────────────────
-
-def normalize_phone(phone: str) -> str:
-    return re.sub(r"[\s\-\(\)]", "", phone)
-
-
-def is_trusted(phone: str, trusted_list: list) -> bool:
-    norm = normalize_phone(phone)
-    for t in trusted_list:
-        t_norm = normalize_phone(str(t))
-        if norm == t_norm:
-            return True
-        if norm.lstrip("+") == t_norm.lstrip("+"):
-            return True
-    return False
-
-
-# ─────────────────────────────────────────────
-# Serial / AT layer
+# ATSerial — queue-based, race-condition free
 # ─────────────────────────────────────────────
 
 class ATSerial:
-    """
-    Queue-based serial reader.
-
-    Єдиний внутрішній reader-loop (_pump) безперервно читає рядки з порту
-    і роздає їх:
-      - у _at_queue  — якщо зараз виконується AT команда (is_at_busy=True)
-      - у _urc_queue — всі інші рядки (URC, unsolicited)
-
-    Це повністю усуває race condition між send_at() і _serial_reader().
-    """
-
     def __init__(self, port: str, baudrate: int, at_timeout: float):
-        self.port = port
-        self.baudrate = baudrate
-        self.at_timeout = at_timeout
-        self._reader = None
-        self._writer = None
-        self._write_lock = asyncio.Lock()   # лок тільки на запис
-        self._at_lock = asyncio.Lock()      # лок на час AT команди
-        self._at_queue: asyncio.Queue = asyncio.Queue()
+        self.port        = port
+        self.baudrate    = baudrate
+        self.at_timeout  = at_timeout
+        self._reader     = None
+        self._writer     = None
+        self._write_lock = asyncio.Lock()
+        self._at_lock    = asyncio.Lock()
+        self._at_queue:  asyncio.Queue = asyncio.Queue()
         self._urc_queue: asyncio.Queue = asyncio.Queue()
-        self._is_at_busy = False
-        self._connected = False
+        self._is_at_busy   = False
+        self._connected    = False
         self._last_activity = time.monotonic()
         self._pump_task: asyncio.Task | None = None
 
@@ -156,7 +230,6 @@ class ATSerial:
         )
         self._connected = True
         self._last_activity = time.monotonic()
-        # Запускаємо єдиний pump loop
         self._pump_task = asyncio.create_task(self._pump(), name="serial_pump")
         logger.info("Serial connected")
 
@@ -179,10 +252,6 @@ class ATSerial:
         self._writer = None
 
     async def _pump(self):
-        """
-        Єдиний reader coroutine — читає рядки і розподіляє по чергах.
-        Ніхто більше не читає з self._reader напряму.
-        """
         while self._connected:
             try:
                 raw = await asyncio.wait_for(self._reader.readline(), timeout=2.0)
@@ -191,7 +260,6 @@ class ATSerial:
                     continue
                 self._last_activity = time.monotonic()
                 logger.debug(f"<< {decoded!r}")
-                # Якщо зараз виконується AT команда — рядок іде в AT чергу
                 if self._is_at_busy:
                     await self._at_queue.put(decoded)
                 else:
@@ -206,26 +274,18 @@ class ATSerial:
                 await asyncio.sleep(0.5)
 
     async def send_at(self, cmd: str, wait_for: str = "OK", timeout: float | None = None) -> str:
-        """
-        Надіслати AT команду і дочекатись відповіді.
-        Під час виконання всі рядки з serial йдуть у _at_queue.
-        """
         if not self._connected:
             raise ConnectionError("Serial not connected")
         timeout = timeout or self.at_timeout
-
         async with self._at_lock:
-            # Очищаємо стару AT чергу перед новою командою
             while not self._at_queue.empty():
                 self._at_queue.get_nowait()
-
             self._is_at_busy = True
             try:
                 async with self._write_lock:
                     self._writer.write(f"{cmd}\r\n".encode())
                     await self._writer.drain()
                 self._last_activity = time.monotonic()
-
                 lines = []
                 async with asyncio.timeout(timeout):
                     while True:
@@ -234,22 +294,43 @@ class ATSerial:
                             lines.append(decoded)
                         if decoded in (wait_for, "ERROR", "NO CARRIER", "BUSY"):
                             break
-                        if decoded.startswith("+CMS ERROR") or decoded.startswith("+CME ERROR"):
+                        if decoded.startswith(("+CMS ERROR", "+CME ERROR")):
                             break
                 self._last_activity = time.monotonic()
                 return "\n".join(lines)
-
             except asyncio.TimeoutError:
                 logger.warning(f"AT timeout: {cmd!r}")
                 raise
             finally:
                 self._is_at_busy = False
 
+    async def send_pdu_data(self, pdu: str, timeout: float = 30.0) -> str:
+        if not self._connected:
+            raise ConnectionError("Serial not connected")
+        async with self._at_lock:
+            while not self._at_queue.empty():
+                self._at_queue.get_nowait()
+            self._is_at_busy = True
+            try:
+                async with self._write_lock:
+                    self._writer.write((pdu + "\x1A").encode())
+                    await self._writer.drain()
+                lines = []
+                async with asyncio.timeout(timeout):
+                    while True:
+                        decoded = await self._at_queue.get()
+                        if decoded:
+                            lines.append(decoded)
+                        if decoded in ("OK", "ERROR") or decoded.startswith(("+CMS ERROR", "+CMGS")):
+                            break
+                return "\n".join(lines)
+            except asyncio.TimeoutError:
+                logger.error("PDU send timeout")
+                raise
+            finally:
+                self._is_at_busy = False
+
     async def read_urc(self, timeout: float = 1.0) -> str | None:
-        """
-        Отримати наступний URC рядок (unsolicited).
-        Викликається з _serial_reader — без прямого читання з порту.
-        """
         if not self._connected:
             return None
         try:
@@ -260,60 +341,25 @@ class ATSerial:
             logger.error(f"read_urc error: {e}")
             return None
 
-    async def send_pdu_data(self, pdu: str, timeout: float = 30.0) -> str:
-        """
-        Надіслати PDU дані після промпту '>' для SMS.
-        Використовує той самий AT lock і чергу.
-        """
-        if not self._connected:
-            raise ConnectionError("Serial not connected")
-
-        async with self._at_lock:
-            while not self._at_queue.empty():
-                self._at_queue.get_nowait()
-
-            self._is_at_busy = True
-            try:
-                async with self._write_lock:
-                    self._writer.write((pdu + "\x1A").encode())
-                    await self._writer.drain()
-
-                lines = []
-                async with asyncio.timeout(timeout):
-                    while True:
-                        decoded = await self._at_queue.get()
-                        if decoded:
-                            lines.append(decoded)
-                        if decoded in ("OK", "ERROR") or decoded.startswith("+CMS ERROR") or decoded.startswith("+CMGS"):
-                            break
-                return "\n".join(lines)
-            except asyncio.TimeoutError:
-                logger.error("PDU send timeout")
-                raise
-            finally:
-                self._is_at_busy = False
-
 
 # ─────────────────────────────────────────────
-# Modem manager
+# ModemManager
 # ─────────────────────────────────────────────
 
 class ModemManager:
-    def __init__(self, at: ATSerial, cfg: dict):
+    def __init__(self, at: ATSerial):
         self.at = at
-        self.cfg = cfg
 
     async def init_modem(self):
-        cmds = [
-            ("AT", "OK"),
-            ("ATE0", "OK"),
-            ("AT+CMGF=0", "OK"),
+        for cmd, expect in [
+            ("AT",                "OK"),
+            ("ATE0",              "OK"),
+            ("AT+CMGF=0",         "OK"),
             ("AT+CNMI=2,2,0,0,0", "OK"),
-            ("AT+CLIP=1", "OK"),
-            ("AT+CLTS=1", "OK"),
-            ("AT+CSCS=\"UCS2\"", "OK"),
-        ]
-        for cmd, expect in cmds:
+            ("AT+CLIP=1",         "OK"),
+            ("AT+CLTS=1",         "OK"),
+            ('AT+CSCS="UCS2"',    "OK"),
+        ]:
             try:
                 await self.at.send_at(cmd, wait_for=expect)
             except Exception as e:
@@ -321,69 +367,66 @@ class ModemManager:
         logger.info("Modem initialized")
 
     async def get_status(self) -> dict:
-        status = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "online": False,
-            "signal_rssi": None,
-            "signal_dbm": None,
-            "operator": None,
-            "sim_ready": False,
+        status: dict = {
+            "timestamp":    datetime.utcnow().isoformat() + "Z",
+            "online":       False,
+            "signal_rssi":  None,
+            "signal_dbm":   None,
+            "operator":     None,
+            "sim_ready":    False,
             "registration": None,
         }
         try:
-            resp = await self.at.send_at("AT+CSQ")
-            m = re.search(r"\+CSQ:\s*(\d+),(\d+)", resp)
+            r = await self.at.send_at("AT+CSQ")
+            m = re.search(r"\+CSQ:\s*(\d+),", r)
             if m:
                 rssi = int(m.group(1))
                 status["signal_rssi"] = rssi
-                if rssi != 99:
+                if rssi not in (0, 99):
                     status["signal_dbm"] = -113 + rssi * 2
                     status["online"] = True
 
-            resp = await self.at.send_at("AT+CPIN?")
-            if "READY" in resp:
-                status["sim_ready"] = True
+            r = await self.at.send_at("AT+CPIN?")
+            status["sim_ready"] = "READY" in r
 
-            resp = await self.at.send_at("AT+CREG?")
-            m = re.search(r"\+CREG:\s*\d+,(\d+)", resp)
+            r = await self.at.send_at("AT+CREG?")
+            m = re.search(r"\+CREG:\s*\d+,(\d+)", r)
             if m:
-                reg_map = {"0": "not_registered", "1": "registered_home",
-                           "2": "searching", "3": "denied", "5": "registered_roaming"}
-                status["registration"] = reg_map.get(m.group(1), m.group(1))
+                status["registration"] = {
+                    "0": "not_registered", "1": "registered_home",
+                    "2": "searching",      "3": "denied",
+                    "5": "registered_roaming",
+                }.get(m.group(1), m.group(1))
 
-            resp = await self.at.send_at("AT+COPS?")
-            m = re.search(r'\+COPS:\s*\d+,\d+,"([^"]+)"', resp)
+            r = await self.at.send_at("AT+COPS?")
+            m = re.search(r'\+COPS:\s*\d+,\d+,"([^"]+)"', r)
             if m:
                 try:
                     status["operator"] = decode_ucs2(m.group(1))
                 except Exception:
                     status["operator"] = m.group(1)
         except Exception as e:
-            logger.warning(f"Status error: {e}")
+            logger.warning(f"get_status error: {e}")
 
-        # Write to status file for Web UI
         try:
             with open(STATUS_FILE, "w", encoding="utf-8") as f:
                 json.dump(status, f, ensure_ascii=False)
         except Exception:
             pass
-
         return status
 
     async def send_sms(self, phone: str, text: str) -> bool:
         try:
             pdu, pdu_len = build_pdu(phone, text)
-            # Крок 1: ініціювати передачу — чекаємо промпт '>'
             resp = await self.at.send_at(f"AT+CMGS={pdu_len}", wait_for=">", timeout=10)
             if ">" not in resp:
                 logger.error(f"CMGS prompt missing: {resp!r}")
                 return False
-            # Крок 2: надіслати PDU через окремий метод з власним локом
             full = await self.at.send_pdu_data(pdu, timeout=30)
             if "OK" in full or "+CMGS" in full:
                 logger.info(f"SMS sent to {phone}")
                 return True
-            logger.error(f"SMS failed: {full!r}")
+            logger.error(f"SMS send failed: {full!r}")
             return False
         except Exception as e:
             logger.error(f"send_sms error: {e}")
@@ -403,6 +446,13 @@ class ModemManager:
             logger.error(f"Dial error: {e}")
             return False
 
+    async def reboot(self):
+        logger.info("Rebooting modem via AT+CFUN=1,1")
+        try:
+            await self.at.send_at("AT+CFUN=1,1", wait_for="OK", timeout=5)
+        except Exception:
+            pass  # модем може не відповісти — це нормально
+
 
 # ─────────────────────────────────────────────
 # URC parser
@@ -414,7 +464,12 @@ class URCParser:
             return {"type": "sms_header", "raw": line}
         m = re.match(r'\+CLIP:\s*"([^"]*)"', line)
         if m:
-            return {"type": "call", "caller": _decode_safe(m.group(1))}
+            caller = m.group(1)
+            try:
+                caller = decode_ucs2(caller)
+            except Exception:
+                pass
+            return {"type": "call", "caller": caller}
         if line == "RING":
             return {"type": "ring"}
         if line in ("NO CARRIER", "BUSY", "NO ANSWER"):
@@ -422,43 +477,33 @@ class URCParser:
         return None
 
 
-def _decode_safe(s: str) -> str:
-    try:
-        return decode_ucs2(s)
-    except Exception:
-        return s
-
-
 # ─────────────────────────────────────────────
-# Main Gateway
+# Gateway
 # ─────────────────────────────────────────────
 
 class GSMMQTTGateway:
     def __init__(self, cfg: dict):
-        self.cfg = cfg
-        self.topics = cfg["topics"]
+        self.cfg        = cfg
+        self.topics     = cfg["topics"]
         self.serial_cfg = cfg["serial"]
-        self.mqtt_cfg = cfg["mqtt"]
-        self.gw_cfg = cfg["gateway"]
+        self.mqtt_cfg   = cfg["mqtt"]
+        self.gw_cfg     = cfg["gateway"]
 
-        self.at = ATSerial(
-            port=self.serial_cfg["port"],
-            baudrate=self.serial_cfg["baudrate"],
-            at_timeout=self.gw_cfg["at_command_timeout"],
+        self.at    = ATSerial(
+            port       = self.serial_cfg["port"],
+            baudrate   = self.serial_cfg["baudrate"],
+            at_timeout = self.gw_cfg["at_command_timeout"],
         )
-        self.modem = ModemManager(self.at, cfg)
-        self.urc = URCParser()
+        self.modem = ModemManager(self.at)
+        self.urc   = URCParser()
 
         self._mqtt_client = None
         self._send_queue: asyncio.Queue = asyncio.Queue()
         self._running = False
-        self._trusted: list = []
-        raw_trusted = self.gw_cfg.get("trusted_numbers", [])
-        # Guard: може прийти None, int, або список
-        if isinstance(raw_trusted, list):
-            self._trusted = [normalize_phone(str(n)) for n in raw_trusted]
-        elif raw_trusted:
-            self._trusted = [normalize_phone(str(raw_trusted))]
+
+        raw_trusted    = self.gw_cfg.get("trusted_numbers", [])
+        self._trusted  = parse_trusted_list(raw_trusted)
+        logger.info(f"Trusted numbers loaded ({len(self._trusted)}): {self._trusted}")
 
     # ── Serial ────────────────────────────────
 
@@ -476,128 +521,106 @@ class GSMMQTTGateway:
         timeout = self.serial_cfg["watchdog_timeout"]
         while self._running:
             await asyncio.sleep(10)
-            if self.at.connected:
-                idle = time.monotonic() - self.at.last_activity
-                if idle > timeout:
-                    logger.warning(f"Watchdog: {idle:.0f}s idle, reconnecting")
-                    await self.at.disconnect()
-                    await self._connect_serial()
+            if not self.at.connected:
+                continue
+            idle = time.monotonic() - self.at.last_activity
+            if idle > timeout:
+                logger.warning(f"Watchdog: {idle:.0f}s idle — reconnecting")
+                await self.at.disconnect()
+                await asyncio.sleep(1)
+                await self._connect_serial()
 
     async def _serial_reader(self):
-        sms_header = None
+        sms_header: str | None = None
         while self._running:
             if not self.at.connected:
                 await asyncio.sleep(1)
                 continue
             try:
-                # Читаємо з URC черги — не напряму з serial порту
                 line = await self.at.read_urc(timeout=1.0)
                 if not line:
                     continue
-
-                # Двострочний SMS: заголовок потім PDU
                 if sms_header is not None:
                     await self._handle_sms_pdu(sms_header, line)
                     sms_header = None
                     continue
-
                 event = self.urc.parse(line)
                 if event is None:
                     continue
-
                 if event["type"] == "sms_header":
                     sms_header = event["raw"]
                 elif event["type"] == "call":
-                    caller = event["caller"]
-                    await self._publish_call(caller)
-                    await asyncio.sleep(0.5)
+                    await self._publish_call(event["caller"])
+                    await asyncio.sleep(0.3)
                     await self.modem.hangup()
                 elif event["type"] == "ring":
                     logger.debug("RING — waiting for CLIP")
-
-            except ConnectionError:
-                logger.error("Serial lost, reconnecting")
-                await asyncio.sleep(2)
-                await self._connect_serial()
+                elif event["type"] == "call_ended":
+                    logger.debug(f"Call ended: {event['reason']}")
             except Exception as e:
-                logger.error(f"Reader error: {e}")
+                logger.error(f"Serial reader error: {e}")
                 await asyncio.sleep(1)
 
     async def _handle_sms_pdu(self, header: str, pdu_line: str):
         try:
-            phone, text = self._decode_incoming_pdu(pdu_line)
-            trusted_flag = 1 if is_trusted(phone, self._trusted) else 0
-            logger.info(f"SMS from {phone} (trusted={trusted_flag}): {text[:50]}")
-            payload = json.dumps({
+            phone, text = decode_incoming_pdu(pdu_line)
+            trusted = 1 if is_trusted(phone, self._trusted) else 0
+            logger.info(f"SMS from {phone} (trusted={trusted}): {text[:60]}")
+            await self._mqtt_publish(self.topics["sms_inbox"], json.dumps({
                 "from": phone, "text": text,
-                "trusted": trusted_flag,
+                "trusted": trusted,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
-            }, ensure_ascii=False)
-            await self._mqtt_publish(self.topics["sms_inbox"], payload)
+            }, ensure_ascii=False))
         except Exception as e:
-            logger.error(f"PDU error: {e}, raw={pdu_line!r}")
+            logger.error(f"SMS PDU decode error: {e} | raw={pdu_line!r}")
 
-    def _decode_incoming_pdu(self, pdu: str) -> tuple[str, str]:
-        idx = 0
+    async def _publish_call(self, caller: str):
+        trusted = 1 if is_trusted(caller, self._trusted) else 0
+        logger.info(f"Call from {caller} (trusted={trusted})")
+        await self._mqtt_publish(self.topics["call_inbox"], json.dumps({
+            "from": caller, "action": "hangup",
+            "trusted": trusted,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }, ensure_ascii=False))
 
-        def read(n):
-            nonlocal idx
-            val = pdu[idx:idx + n]
-            idx += n
-            return val
+    # ── Web UI command polling ─────────────────
 
-        smsc_len = int(read(2), 16)
-        read(smsc_len * 2)
-        pdu_type = int(read(2), 16)
-        oa_len = int(read(2), 16)
-        oa_type = int(read(2), 16)
-        oa_bytes = (oa_len + 1) // 2 * 2
-        oa_raw = read(oa_bytes)
+    async def _webui_cmd_loop(self):
+        """Перевіряє CMD_FILE на команди з Web UI."""
+        import pathlib
+        while self._running:
+            await asyncio.sleep(1)
+            try:
+                p = pathlib.Path(CMD_FILE)
+                if not p.exists():
+                    continue
+                raw = p.read_text(encoding="utf-8").strip()
+                p.unlink()
+                if not raw:
+                    continue
+                cmd    = json.loads(raw)
+                action = cmd.get("action", "")
 
-        if oa_type in (0x91, 0x81):
-            phone = ""
-            for i in range(0, len(oa_raw) - 1, 2):
-                phone += oa_raw[i + 1]
-                if oa_raw[i] != "F":
-                    phone += oa_raw[i]
-            if oa_type == 0x91:
-                phone = "+" + phone
-        else:
-            phone = oa_raw
+                if action == "reboot_modem":
+                    logger.info("Web UI: modem reboot")
+                    await self.modem.reboot()
+                    await asyncio.sleep(5)
+                    await self.at.disconnect()
+                    await self._connect_serial()
 
-        read(2)  # pid
-        dcs_raw = int(read(2), 16)
-        vp_format = (pdu_type >> 3) & 0x03
-        if vp_format == 0x02:
-            read(2)
-        elif vp_format in (0x01, 0x03):
-            read(14)
-        read(14)  # SCTS
-        udl = int(read(2), 16)
+                elif action == "send_sms":
+                    phone = cmd.get("to", "").strip()
+                    text  = cmd.get("text", "").strip()
+                    if phone and text:
+                        logger.info(f"Web UI: send SMS to {phone}")
+                        await self.modem.send_sms(phone, text)
+                    else:
+                        logger.warning("Web UI send_sms: missing 'to' or 'text'")
 
-        if dcs_raw & 0x08:
-            text = decode_ucs2(pdu[idx:])
-        elif (dcs_raw >> 2) & 0x03 == 0x01:
-            text = bytes.fromhex(pdu[idx:]).decode("latin-1", errors="replace")
-        else:
-            text = self._decode_gsm7(pdu[idx:], udl)
-        return phone, text
-
-    @staticmethod
-    def _decode_gsm7(hex_str: str, num_chars: int) -> str:
-        gsm7 = (
-            "@\u00a3$\u00a5\u00e8\u00e9\u00f9\u00ec\u00f2\u00c7\n\u00d8\u00f8\r\u00c5\u00e5"
-            "\u0394_\u03a6\u0393\u039b\u03a9\u03a0\u03a8\u03a3\u03b8\u039e\x1b\u00c6\u00e6\u00df\u00c9"
-            " !\"#\u00a4%&'()*+,-./0123456789:;<=>?"
-            "\u00a1ABCDEFGHIJKLMNOPQRSTUVWXYZ\u00c4\u00d6\u00d1\u00dc\u00a7"
-            "\u00bfabcdefghijklmnopqrstuvwxyz\u00e4\u00f6\u00f1\u00fc\u00e0"
-        )
-        data = bytes.fromhex(hex_str)
-        bits = int.from_bytes(data, "little")
-        return "".join(
-            gsm7[(bits >> (i * 7)) & 0x7F] if (bits >> (i * 7)) & 0x7F < len(gsm7) else "?"
-            for i in range(num_chars)
-        )
+            except json.JSONDecodeError as e:
+                logger.warning(f"Web UI cmd JSON error: {e}")
+            except Exception as e:
+                logger.error(f"Web UI cmd loop error: {e}")
 
     # ── MQTT ──────────────────────────────────
 
@@ -605,14 +628,14 @@ class GSMMQTTGateway:
         interval = self.mqtt_cfg.get("reconnect_interval", 5)
         while self._running:
             try:
-                logger.info(f"MQTT connecting to {self.mqtt_cfg['host']}:{self.mqtt_cfg['port']}")
+                logger.info(f"MQTT connecting {self.mqtt_cfg['host']}:{self.mqtt_cfg['port']}")
                 async with aiomqtt.Client(
-                    hostname=self.mqtt_cfg["host"],
-                    port=self.mqtt_cfg["port"],
-                    username=self.mqtt_cfg["username"] or None,
-                    password=self.mqtt_cfg["password"] or None,
-                    identifier=self.mqtt_cfg["client_id"],
-                    keepalive=self.mqtt_cfg["keepalive"],
+                    hostname  = self.mqtt_cfg["host"],
+                    port      = self.mqtt_cfg["port"],
+                    username  = self.mqtt_cfg["username"] or None,
+                    password  = self.mqtt_cfg["password"] or None,
+                    identifier= self.mqtt_cfg["client_id"],
+                    keepalive = self.mqtt_cfg["keepalive"],
                 ) as client:
                     self._mqtt_client = client
                     logger.info("MQTT connected")
@@ -636,14 +659,17 @@ class GSMMQTTGateway:
             try:
                 data = json.loads(message.payload.decode("utf-8"))
             except Exception:
-                logger.warning(f"Bad payload on {topic}")
+                logger.warning(f"Bad MQTT payload on {topic}")
                 continue
             if topic == self.topics["sms_send"]:
-                phone, text = data.get("to", ""), data.get("text", "")
+                phone = data.get("to", "").strip()
+                text  = data.get("text", "").strip()
                 if phone and text:
                     await self.modem.send_sms(phone, text)
+                else:
+                    logger.warning("sms_send: missing 'to' or 'text'")
             elif topic == self.topics["call_dial"]:
-                phone = data.get("to", "")
+                phone = data.get("to", "").strip()
                 if phone:
                     await self.modem.dial(phone)
 
@@ -653,22 +679,14 @@ class GSMMQTTGateway:
             try:
                 await client.publish(topic, payload, qos=1)
             except Exception as e:
-                logger.error(f"Publish error: {e}")
+                logger.error(f"MQTT publish error: {e}")
             finally:
                 self._send_queue.task_done()
 
     async def _mqtt_publish(self, topic: str, payload: str):
         await self._send_queue.put((topic, payload))
 
-    async def _publish_call(self, caller: str):
-        trusted_flag = 1 if is_trusted(caller, self._trusted) else 0
-        logger.info(f"Call from {caller} (trusted={trusted_flag})")
-        payload = json.dumps({
-            "from": caller, "action": "hangup",
-            "trusted": trusted_flag,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-        }, ensure_ascii=False)
-        await self._mqtt_publish(self.topics["call_inbox"], payload)
+    # ── Status ────────────────────────────────
 
     async def _status_loop(self):
         interval = self.gw_cfg["status_interval"]
@@ -677,24 +695,44 @@ class GSMMQTTGateway:
             if not self.at.connected:
                 continue
             try:
-                status = await self.modem.get_status()
+                status  = await self.modem.get_status()
                 payload = json.dumps(status, ensure_ascii=False)
                 await self._mqtt_publish(self.topics["status"], payload)
-                logger.info(f"Status: online={status['online']}, signal={status.get('signal_dbm')}dBm, op={status.get('operator')}")
+                logger.info(
+                    f"Status: online={status['online']}, "
+                    f"signal={status.get('signal_dbm')}dBm, "
+                    f"op={status.get('operator')}, "
+                    f"reg={status.get('registration')}"
+                )
             except Exception as e:
-                logger.error(f"Status error: {e}")
+                logger.error(f"Status loop error: {e}")
 
-    # ── Run ───────────────────────────────────
+    # ── Run / Stop ────────────────────────────
 
     async def run(self):
         self._running = True
-        logger.info("GSM-MQTT Gateway starting...")
+        logger.info("GSM-MQTT Gateway v1.2.0 starting...")
+        logger.info(f"Serial: {self.serial_cfg['port']} @ {self.serial_cfg['baudrate']}")
+        logger.info(f"MQTT:   {self.mqtt_cfg['host']}:{self.mqtt_cfg['port']}")
+
         await self._connect_serial()
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(self._serial_reader())
-            tg.create_task(self._serial_watchdog())
-            tg.create_task(self._mqtt_loop())
-            tg.create_task(self._status_loop())
+
+        # Незалежні задачі — падіння однієї не вбиває інші
+        tasks = [
+            asyncio.create_task(self._serial_reader(),   name="serial_reader"),
+            asyncio.create_task(self._serial_watchdog(), name="serial_watchdog"),
+            asyncio.create_task(self._mqtt_loop(),       name="mqtt_loop"),
+            asyncio.create_task(self._status_loop(),     name="status_loop"),
+            asyncio.create_task(self._webui_cmd_loop(),  name="webui_cmd"),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except Exception as e:
+            logger.error(f"Fatal task error: {e}")
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def stop(self):
         logger.info("Shutting down...")
@@ -714,16 +752,17 @@ async def main():
     gateway = GSMMQTTGateway(cfg)
 
     loop = asyncio.get_running_loop()
-    import signal
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(gateway.stop()))
+            loop.add_signal_handler(
+                sig, lambda: asyncio.create_task(gateway.stop())
+            )
         except NotImplementedError:
             pass
 
     try:
         await gateway.run()
-    except* KeyboardInterrupt:
+    except KeyboardInterrupt:
         pass
     finally:
         await gateway.stop()

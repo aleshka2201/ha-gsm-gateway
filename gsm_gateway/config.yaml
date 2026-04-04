@@ -1,6 +1,6 @@
 name: "GSM MQTT Gateway"
 description: "SIM800 USB GSM to MQTT gateway. Bidirectional SMS and call handling."
-version: "1.0.0"
+version: "1.2.0"
 slug: "gsm_gateway"
 init: false
 arch:
@@ -63,4 +63,4 @@ devices:
   - /dev/ttyUSB1
   - /dev/ttyACM0
 
-url: "https://github.com/aleshka2201/ha-gsm-gateway"
+url: "https://github.com/your-username/ha-gsm-gateway"
