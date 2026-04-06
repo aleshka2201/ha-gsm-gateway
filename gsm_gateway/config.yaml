@@ -1,6 +1,6 @@
 name: "GSM MQTT Gateway"
 description: "SIM800 USB GSM to MQTT gateway. Bidirectional SMS and call handling with Web UI."
-version: "1.4.1"
+version: "1.6.0"
 slug: "gsm_gateway"
 init: false
 arch:
